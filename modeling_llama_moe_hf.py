@@ -408,7 +408,7 @@ class TopKBalancedNoisyGate(nn.Module):
         noise_epsilon=1e-2,
     ):
         super(TopKBalancedNoisyGate, self).__init__()
-        assert num_selects <= num_experts
+        # assert num_selects <= num_experts
         self.input_size = input_size
         self.num_experts = num_experts
         self.num_selects = num_selects
@@ -486,6 +486,23 @@ class TopKBalancedNoisyGate(nn.Module):
         return x.float().var() / (x.float().mean() ** 2 + eps)
 
     def forward(self, x):
+        if self.num_experts == 0:
+            # 当没有专家时，直接返回一个空的结果
+            return {
+                "topK_indices": torch.empty(0, device=x.device, dtype=torch.long),
+                "topK_scores": torch.empty(0, device=x.device, dtype=x.dtype),
+                "balance_loss": torch.tensor(0.0, device=x.device, dtype=x.dtype),
+                "load": torch.tensor(0.0, device=x.device),
+                "importance": torch.tensor(0.0, device=x.device),
+            }
+        elif self.num_experts < self.num_selects:
+            # Adjust num_selects to match num_experts
+            warnings.warn(
+                f"num_selects ({self.num_selects}) exceeds num_experts ({self.num_experts}). "
+                f"Adjusting num_selects to {self.num_experts}."
+            )
+            self.num_selects = self.num_experts
+
         logits_gate = self.gate_network(x)
         if self.training and self.add_noise:
             noise_mm = self.weight_noise(x)
@@ -718,6 +735,9 @@ class UniversalCalculator(nn.Module):
     def forward(
         self, x, topK_indices, topK_scores, expert_batch_size=None, **kwargs
     ) -> CalculatorOutput:
+        if self.num_experts == 0:
+            # No experts to compute, return input as output
+            return CalculatorOutput(hidden_states=x, num_dropped_tokens=torch.tensor(0.0))
         batch_size = topK_indices.size(0)  # topK_indices: (bsz*seq_len, num_selects)
         num_selects = topK_indices.size(1)
         topK_indices = topK_indices.flatten()  # shape(batch_size*num_selects)
@@ -810,6 +830,15 @@ class BaseMoELayer(nn.Module):
             raise NotImplementedError
 
     def forward(self, x) -> MoEMlpOutput:
+        if self.num_experts == 0:
+            # Skip computation and return input
+            return MoEMlpOutput(
+                hidden_states=x,
+                balance_loss=torch.tensor(0.0, device=x.device),
+                num_dropped_tokens=torch.tensor(0.0),
+                gate_load=[],
+                gate_importance=[],
+            )
         original_shape = x.shape[:-1]
         x = x.reshape(-1, self.input_size)
         gate_outputs: dict = self.gate(x)
@@ -953,7 +982,7 @@ class LinearGLUMoELayer(BaseMoELayer):
         **kwargs,
     ):
         super(LinearGLUMoELayer, self).__init__()
-        assert num_selects <= num_experts
+        # assert num_selects <= num_experts
         self.input_size = input_size
         self.hidden_size = hidden_size
         self.output_size = output_size
@@ -980,6 +1009,18 @@ class LinearGLUMoELayer(BaseMoELayer):
 class LlamaMoEDecoderLayer(nn.Module):
     def __init__(self, config: LlamaMoEConfig, layer_index):
         super().__init__()
+
+        # 动态设置专家相关参数
+        size_experts = (
+            config.size_experts[layer_index]
+            if config.size_experts is not None
+            else None
+        )
+        # num_experts = len(size_experts) if size_experts else config.num_experts
+        # intermediate_size = sum(size_experts) if size_experts else config.intermediate_size
+        num_experts = len(size_experts)
+        intermediate_size = sum(size_experts)
+        # 动态设置专家相关参数
 
         self.hidden_size = config.hidden_size
         self.self_attn = LlamaAttention(config=config)
@@ -1014,18 +1055,30 @@ class LlamaMoEDecoderLayer(nn.Module):
             "capacity_factor": config.capacity_factor,
         }
 
+        # self.mlp = LinearGLUMoELayer(
+        #     input_size=self.hidden_size,
+        #     hidden_size=config.intermediate_size,
+        #     output_size=self.hidden_size,
+        #     hidden_act=config.hidden_act,
+        #     num_experts=config.num_experts,
+        #     num_selects=config.num_selects,
+        #     size_experts=(
+        #         config.size_experts[layer_index]
+        #         if config.size_experts is not None
+        #         else None
+        #     ),
+        #     bias=False,
+        #     **gating_config,
+        #     **calculator_config,
+        # )
         self.mlp = LinearGLUMoELayer(
-            input_size=self.hidden_size,
-            hidden_size=config.intermediate_size,
-            output_size=self.hidden_size,
+            input_size=config.hidden_size,
+            hidden_size=intermediate_size,
+            output_size=config.hidden_size,
             hidden_act=config.hidden_act,
-            num_experts=config.num_experts,
+            num_experts=num_experts,
             num_selects=config.num_selects,
-            size_experts=(
-                config.size_experts[layer_index]
-                if config.size_experts is not None
-                else None
-            ),
+            size_experts=size_experts,
             bias=False,
             **gating_config,
             **calculator_config,
@@ -1144,12 +1197,27 @@ class LlamaMoEModel(LlamaMoEPreTrainedModel):
         self.vocab_size = config.vocab_size
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
+        # self.layers = nn.ModuleList(
+        #     [LlamaMoEDecoderLayer(config, i) for i in range(config.num_hidden_layers)]
+        # )
         self.layers = nn.ModuleList(
             [LlamaMoEDecoderLayer(config, i) for i in range(config.num_hidden_layers)]
         )
         self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.gradient_checkpointing = False
         self.post_init()
+        self.update_config()
+
+    def update_config(self):
+        self.config.size_experts = [
+            layer.mlp.calculator.experts.size_experts for layer in self.layers
+        ]
+        self.config.num_experts = [
+            layer.mlp.num_experts for layer in self.layers
+        ]
+        self.config.intermediate_size = [
+            layer.mlp.hidden_size for layer in self.layers
+        ]
 
     def get_input_embeddings(self):
         return self.embed_tokens
@@ -1669,5 +1737,4 @@ class LlamaMoEForCausalLM(LlamaMoEPreTrainedModel):
 
     def reset_experts(self):
         self.model.reset_experts()
-
 
