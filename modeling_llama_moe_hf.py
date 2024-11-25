@@ -414,7 +414,7 @@ class TopKBalancedNoisyGate(nn.Module):
         self.num_selects = num_selects
 
         self.gate_network_type = gate_network
-        self.gate_network = self.get_gate_network(gate_network, input_size, num_experts)
+        self.gate_network = self.get_gate_network(gate_network, input_size, 8)
 
         self.use_softmax = use_softmax
         self.softmax = nn.Softmax(1)
@@ -427,9 +427,9 @@ class TopKBalancedNoisyGate(nn.Module):
         self.noise_epsilon = noise_epsilon
         self.warned = False
         if self.add_noise:
-            self.weight_noise = nn.Linear(input_size, num_experts, bias=False)
+            self.weight_noise = nn.Linear(input_size, 8, bias=False)
             self.weight_noise.weight.data = torch.zeros(
-                (num_experts, input_size),
+                (8, input_size),
                 requires_grad=True,
                 device=self.weight_noise.weight.data.device,
                 dtype=self.weight_noise.weight.data.dtype,
@@ -717,6 +717,8 @@ class UniversalCalculator(nn.Module):
         multiply_gate_scores=True,
         score_scale_factor=1.0,
         add_weight_norm: bool = False,
+        layer_index=0,
+        custom_expert_config_per_layer={}
     ):
         super(UniversalCalculator, self).__init__()
         self.experts = experts
@@ -728,6 +730,8 @@ class UniversalCalculator(nn.Module):
         self.mlp_norm = None
         if multiply_gate_scores and add_weight_norm:
             raise NotImplementedError
+        self.layer_index = layer_index
+        self.custom_expert_config_per_layer = custom_expert_config_per_layer
 
     def reset_experts(self):
         self.experts.reset_parameters()
@@ -759,11 +763,20 @@ class UniversalCalculator(nn.Module):
         sorted_x = x.index_select(0, sorted_batch_indices)
         split_x = torch.split(sorted_x, expert_batch_size, dim=0)
 
-        expert_outputs = [
-            self.experts(split_x[i], i)
-            for i in range(self.num_experts)
-            if split_x[i].shape[0] > 0
-        ]
+        # expert_outputs = [
+        #     self.experts(split_x[i], i)
+        #     for i in range(8)
+        #     if split_x[i].shape[0] > 0
+        # ]
+        expert_outputs = []
+        custom_expert_config_layer = self.custom_expert_config_per_layer[self.layer_index]
+        count = 0
+        for i in range(8):
+            if i in custom_expert_config_layer:
+                expert_outputs.append(self.experts(split_x[i], count))
+                count += 1
+            else:
+                expert_outputs.append(split_x[i])
 
         # (bsz*seq_len*num_selects, hidden_size)
         cat_expert_outputs = torch.cat(expert_outputs, 0)
@@ -825,6 +838,8 @@ class BaseMoELayer(nn.Module):
                 multiply_gate_scores=kwargs.get("multiply_gate_scores", True),
                 score_scale_factor=kwargs.get("score_scale_factor", 1.0),
                 add_weight_norm=kwargs.get("add_weight_norm", False),
+                layer_index=kwargs.get("layer_index", 0),
+                custom_expert_config_per_layer=kwargs.get("custom_expert_config_per_layer", {})
             )
         else:
             raise NotImplementedError
@@ -1053,6 +1068,8 @@ class LlamaMoEDecoderLayer(nn.Module):
             "drop_tokens": config.drop_tokens,
             "dropped_padding": config.dropped_padding,
             "capacity_factor": config.capacity_factor,
+            "layer_index": layer_index,
+            "custom_expert_config_per_layer": config.custom_expert_config_per_layer
         }
 
         # self.mlp = LinearGLUMoELayer(
