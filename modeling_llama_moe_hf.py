@@ -757,11 +757,12 @@ class UniversalCalculator(nn.Module):
 
         if expert_batch_size is None:
             expert_batch_size = topK_indices.bincount(
-                minlength=self.num_experts
+                minlength=8
             ).tolist()
 
         sorted_x = x.index_select(0, sorted_batch_indices)
         split_x = torch.split(sorted_x, expert_batch_size, dim=0)
+        print("split_x length: ", len(split_x))
 
         # expert_outputs = [
         #     self.experts(split_x[i], i)
@@ -772,6 +773,8 @@ class UniversalCalculator(nn.Module):
         custom_expert_config_layer = self.custom_expert_config_per_layer[self.layer_index]
         count = 0
         for i in range(8):
+            if split_x[i].shape[0] == 0:
+                continue
             if i in custom_expert_config_layer:
                 expert_outputs.append(self.experts(split_x[i], count))
                 count += 1
@@ -818,7 +821,8 @@ class BaseMoELayer(nn.Module):
             self.gate = TopKBalancedNoisyGate(
                 self.input_size,
                 self.num_experts,
-                self.num_selects,
+                # self.num_selects,
+                2,
                 gate_network=kwargs.get("gate_network", "mlp"),
                 use_softmax=kwargs.get("gate_use_softmax", True),
                 use_balance=kwargs.get("gate_use_balance", True),
